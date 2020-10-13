@@ -7,8 +7,8 @@ from torch import sigmoid
 from torch.jit import script
 from torch.autograd import Function
 from torch.nn import ReLU, LeakyReLU
-from torch.nn import Module, ModuleList, Sequential, Conv1d, BatchNorm1d, Dropout
-from torch.nn.functional import log_softmax
+from torch.nn import Module, ModuleList, Sequential, Conv1d, BatchNorm1d, Dropout, AvgPool1d, AdaptiveAvgPool1d
+from torch.nn.functional import log_softmax, interpolate
 
 from fast_ctc_decode import beam_search, viterbi_search
 
@@ -239,3 +239,61 @@ class Decoder(Module):
     def forward(self, x):
         x = self.layers(x).permute(2, 0, 1)
         return log_softmax(x, dim=2)
+
+
+class SqueezeExcite(Module):
+    def __init__(
+        self,
+        channels: int,
+        reduction_ratio: int,
+        context_window: int = -1,
+        interpolation_mode: str = 'nearest',
+        activation: Optional[Callable] = None,
+    ):
+        """
+        Squeeze-and-Excitation sub-module.
+        Args:
+            channels: Input number of channels.
+            reduction_ratio: Reduction ratio for "squeeze" layer.
+            context_window: Integer number of timesteps that the context
+                should be computed over, using stride 1 average pooling.
+                If value < 1, then global context is computed.
+            interpolation_mode: Interpolation mode of timestep dimension.
+                Used only if context window is > 1.
+                The modes available for resizing are: `nearest`, `linear` (3D-only),
+                `bilinear`, `area`
+            activation: Intermediate activation function used. Must be a
+                callable activation function.
+        """
+        super(SqueezeExcite, self).__init__()
+        self.context_window = int(context_window)
+        self.interpolation_mode = interpolation_mode
+
+        if self.context_window <= 0:
+            self.pool = AdaptiveAvgPool1d(1)  # context window = T
+        else:
+            self.pool = AvgPool1d(self.context_window, stride=1)
+
+        if activation is None:
+            activation = ReLU(inplace=True)
+
+        self.fc = nn.Sequential(
+            Linear(channels, channels // reduction_ratio, bias=False),
+            activation,
+            Linear(channels // reduction_ratio, channels, bias=False),
+        )
+
+    def forward(self, x):
+        # The use of negative indices on the transpose allow for expanded SqueezeExcite
+        batch, channels, timesteps = x.size()[:3]
+        y = self.pool(x)  # [B, C, T - context_window + 1]
+        y = y.transpose(1, -1)  # [B, T - context_window + 1, C]
+        y = self.fc(y)  # [B, T - context_window + 1, C]
+        y = y.transpose(1, -1)  # [B, C, T - context_window + 1]
+
+        if self.context_window > 0:
+            y = interpolate(y, size=timesteps, mode=self.interpolation_mode)
+
+        y = sigmoid(y)
+
+        return x * y
